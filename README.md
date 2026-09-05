@@ -2,7 +2,7 @@
 
 A small Codex `UserPromptSubmit` hook that automatically gives **Codex CLI** conversations a useful title as soon as the user submits a prompt.
 
-Validated with **Codex CLI 0.148.0** on 2026-08-19.
+Validated with **Codex CLI 0.151.0** on 2026-09-05.
 
 It deliberately does **not** edit `state_*.sqlite`, rollout JSONL files, or other Codex state files directly. Thread inspection and renaming go through Codex app-server APIs.
 
@@ -12,11 +12,11 @@ On each `UserPromptSubmit` event the hook launcher exits quickly after starting 
 
 1. Reads the thread through `thread/read`.
 2. Requires `thread.source == "cli"`, so Desktop/app-server/exec threads are ignored.
-3. Refuses to overwrite a non-empty thread name. Manual `/rename` always wins.
-4. Uses the thread preview (normally the first user request) to generate a short title with an **ephemeral** `codex exec` child.
-5. Reads the thread again before writing, so a manual rename performed while title generation is running is preserved.
-6. Sets the title through `thread/name/set`.
-7. Records a small processed marker so later turns do not rename the thread again.
+3. Uses the persisted thread preview when available, otherwise the `UserPromptSubmit.prompt` text so naming can start before app-server preview persistence catches up.
+4. Treats Codex's automatic initial 36-character preview-derived name as provisional, while preserving any other existing name as an explicit/manual name. Manual `/rename` still wins.
+5. Generates a short title with an **ephemeral** `codex exec` child.
+6. Reads the thread again before writing: a manual rename performed during generation is preserved, while a Codex provisional name that appears during the race is replaceable.
+7. Sets the final title through `thread/name/set` and records a small processed marker so later turns do not rename the thread again.
 
 The Codex hook itself is synchronous but intentionally tiny: it only starts a detached background worker and returns immediately. This works with Codex builds that currently skip `async` hooks. The background worker does the app-server lookup and title generation. If generation fails, it uses a conservative local fallback based on the first request. Operational errors never block the Codex turn and are retried on a later `UserPromptSubmit` event.
 
@@ -25,8 +25,9 @@ The Codex hook itself is synchronous but intentionally tiny: it only starts a de
 - No direct SQLite writes.
 - No direct rollout/transcript edits.
 - Only threads whose app-server source is `cli` are auto-named.
-- Existing names are never overwritten.
-- A second name check closes the manual-rename race.
+- Explicit/manual names are never overwritten; only Codex's known provisional initial preview-derived name is replaceable.
+- A second name check closes both the manual-rename race and the Codex-initial-name race.
+- The hook forwards at most 6000 prompt characters to its detached worker, avoiding the old empty-preview retry without putting an unbounded prompt in the worker environment.
 - A per-session lock prevents duplicate concurrent `UserPromptSubmit` workers.
 - The title-generation child sets `CODEX_AUTO_TITLE_CHILD=1` so its own `UserPromptSubmit` hook exits immediately and cannot recurse.
 - Logs contain session IDs and status/error classes, but not prompt text or generated titles.
@@ -105,4 +106,4 @@ Conceptually the installer adds this group to `hooks.UserPromptSubmit` (the real
 
 ## Why `UserPromptSubmit`
 
-`UserPromptSubmit` fires as soon as the user submits a prompt, so a resumed unnamed thread can be titled without waiting for the main agent turn to finish. The launcher only detaches a worker; the worker then asks app-server for authoritative thread metadata, including the actual session source, original preview, and current name.
+`UserPromptSubmit` fires as soon as the user submits a prompt, so a resumed unnamed thread can be titled without waiting for the main agent turn to finish. The launcher detaches a worker and forwards a bounded copy of the hook's text prompt. The worker still asks app-server for authoritative session source, preview, and current name, but can use the hook prompt while `thread.preview` is temporarily empty. This avoids losing the naming race to Codex's own provisional initial title.

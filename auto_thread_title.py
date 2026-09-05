@@ -25,8 +25,10 @@ from typing import Any, Iterator
 
 APP_NAME = "codex_auto_thread_title"
 APP_TITLE = "Codex Auto Thread Title Hook"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 DEFAULT_TIMEOUT_SECONDS = 90
+CODEX_INITIAL_NAME_MAX_CHARS = 36
+MAX_WORKER_PROMPT_CHARS = 6000
 DEFAULT_MAX_TITLE_CHARS = 64
 DEFAULT_LOCK_STALE_SECONDS = 15 * 60
 CHILD_GUARD_ENV = "CODEX_AUTO_TITLE_CHILD"
@@ -168,6 +170,11 @@ def spawn_background_worker(payload: dict[str, Any]) -> None:
     model = payload.get("model")
     if isinstance(model, str) and model:
         reduced_payload["model"] = model
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        # UserPromptSubmit exposes the text prompt before app-server preview persistence catches up.
+        # Keep only the prefix needed for title generation so the detached worker environment stays small.
+        reduced_payload["prompt"] = prompt[:MAX_WORKER_PROMPT_CHARS]
 
     env = os.environ.copy()
     env[WORKER_PAYLOAD_ENV] = json.dumps(reduced_payload, ensure_ascii=False, separators=(",", ":"))
@@ -346,6 +353,28 @@ def sanitize_title(raw: str, limit: int | None = None) -> str:
     return title
 
 
+def _compact_thread_text(text: str) -> str:
+    """Normalize thread preview/prompt text the same way Codex presents one-line initial names."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_codex_initial_name(name: Any, preview: str) -> bool:
+    """Return True for Codex's automatic initial preview-derived thread name.
+
+    Codex CLI 0.151 uses the first 36 characters of the initial preview as its early
+    thread name. That name is provisional for this hook and must not be confused with
+    a user `/rename`, which remains authoritative.
+    """
+    if not isinstance(name, str) or not name.strip() or not isinstance(preview, str):
+        return False
+    compact_preview = _compact_thread_text(preview)
+    if not compact_preview:
+        return False
+    expected = compact_preview[:CODEX_INITIAL_NAME_MAX_CHARS].strip()
+    return name.strip() == expected
+
+
 def heuristic_title(preview: str, limit: int | None = None) -> str:
     limit = limit or max_title_chars()
     text = preview.strip()
@@ -467,24 +496,31 @@ def handle_hook(payload: dict[str, Any]) -> int:
                     log_event("skip", session_id=session_id, reason="non_cli", source=source)
                     return 0
 
-                current_name = thread.get("name")
-                if isinstance(current_name, str) and current_name.strip():
-                    mark_processed(session_id, "already_named")
-                    log_event("skip", session_id=session_id, reason="already_named")
+                preview = thread.get("preview")
+                preview = preview if isinstance(preview, str) else ""
+                hook_prompt = payload.get("prompt")
+                hook_prompt = hook_prompt if isinstance(hook_prompt, str) else ""
+                title_source = preview.strip() or hook_prompt.strip()
+                if not title_source:
+                    log_event("retry_later", session_id=session_id, reason="empty_preview_and_prompt")
                     return 0
 
-                preview = thread.get("preview")
-                if not isinstance(preview, str) or not preview.strip():
-                    log_event("retry_later", session_id=session_id, reason="empty_preview")
-                    return 0
+                current_name = thread.get("name")
+                if isinstance(current_name, str) and current_name.strip():
+                    if is_codex_initial_name(current_name, title_source):
+                        log_event("continue", session_id=session_id, reason="codex_initial_name")
+                    else:
+                        mark_processed(session_id, "already_named")
+                        log_event("skip", session_id=session_id, reason="already_named")
+                        return 0
 
                 model = payload.get("model") if isinstance(payload.get("model"), str) else None
                 provider = thread.get("modelProvider") if isinstance(thread.get("modelProvider"), str) else None
                 try:
-                    title = generate_title(preview, model=model, provider=provider)
+                    title = generate_title(title_source, model=model, provider=provider)
                     generation = "model"
                 except Exception as exc:
-                    title = heuristic_title(preview)
+                    title = heuristic_title(title_source)
                     generation = "heuristic"
                     log_event(
                         "generation_fallback",
@@ -496,10 +532,15 @@ def handle_hook(payload: dict[str, Any]) -> int:
                 # generation was happening in the background.
                 fresh_thread = client.read_thread(session_id)
                 fresh_name = fresh_thread.get("name")
+                fresh_preview = fresh_thread.get("preview")
+                fresh_title_source = (fresh_preview if isinstance(fresh_preview, str) else "").strip() or title_source
                 if isinstance(fresh_name, str) and fresh_name.strip():
-                    mark_processed(session_id, "named_during_generation")
-                    log_event("skip", session_id=session_id, reason="named_during_generation")
-                    return 0
+                    if is_codex_initial_name(fresh_name, fresh_title_source):
+                        log_event("continue", session_id=session_id, reason="codex_initial_name_during_generation")
+                    else:
+                        mark_processed(session_id, "named_during_generation")
+                        log_event("skip", session_id=session_id, reason="named_during_generation")
+                        return 0
 
                 client.set_thread_name(session_id, title)
                 mark_processed(session_id, "auto_named")

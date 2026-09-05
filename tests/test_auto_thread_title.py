@@ -81,6 +81,26 @@ class AutoTitleTests(unittest.TestCase):
                 )
                 self.assertNotIn("last_assistant_message", worker_payload)
 
+    def test_launcher_forwards_bounded_prompt_for_preview_race(self):
+        with tempfile.TemporaryDirectory() as state:
+            long_prompt = "x" * (auto.MAX_WORKER_PROMPT_CHARS + 100)
+            with (
+                mock.patch.dict("os.environ", {"CODEX_AUTO_TITLE_STATE_DIR": state}, clear=False),
+                mock.patch.object(auto.subprocess, "Popen") as popen,
+            ):
+                auto.spawn_background_worker(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": "s-prompt",
+                        "model": "gpt-test",
+                        "prompt": long_prompt,
+                    }
+                )
+                _, kwargs = popen.call_args
+                worker_payload = json.loads(kwargs["env"][auto.WORKER_PAYLOAD_ENV])
+                self.assertEqual(len(worker_payload["prompt"]), auto.MAX_WORKER_PROMPT_CHARS)
+                self.assertEqual(worker_payload["prompt"], long_prompt[: auto.MAX_WORKER_PROMPT_CHARS])
+
     def test_non_cli_thread_is_never_named(self):
         with tempfile.TemporaryDirectory() as state:
             FakeClient.threads = [{"source": "appServer", "name": None, "preview": "hello"}]
@@ -94,6 +114,45 @@ class AutoTitleTests(unittest.TestCase):
                 self.assertEqual(FakeClient.names, [])
                 marker = json.loads((Path(state) / "processed" / "s1.json").read_text(encoding="utf-8"))
                 self.assertEqual(marker["reason"], "source:appServer")
+
+    def test_codex_initial_preview_name_is_replaceable(self):
+        with tempfile.TemporaryDirectory() as state:
+            preview = "[Image #1] 为什么我的 Tom pet 不出现在 CLI Pets 列表中?"
+            provisional = auto._compact_thread_text(preview)[: auto.CODEX_INITIAL_NAME_MAX_CHARS]
+            FakeClient.threads = [
+                {"source": "cli", "name": provisional, "preview": preview, "modelProvider": "www"},
+                {"source": "cli", "name": provisional, "preview": preview, "modelProvider": "www"},
+            ]
+            with (
+                mock.patch.dict("os.environ", {"CODEX_AUTO_TITLE_STATE_DIR": state}, clear=False),
+                mock.patch.object(auto, "AppServerClient", FakeClient),
+                mock.patch.object(auto, "find_codex", return_value="codex"),
+                mock.patch.object(auto, "generate_title", return_value="修复 Tom pet 列表显示"),
+            ):
+                auto.handle_hook({"hook_event_name": "UserPromptSubmit", "session_id": "s-provisional", "model": "gpt-test"})
+                self.assertEqual(FakeClient.names, [("s-provisional", "修复 Tom pet 列表显示")])
+                marker = json.loads((Path(state) / "processed" / "s-provisional.json").read_text(encoding="utf-8"))
+                self.assertEqual(marker["reason"], "auto_named")
+
+    def test_empty_app_preview_uses_hook_prompt(self):
+        with tempfile.TemporaryDirectory() as state:
+            prompt = "fix the login bug"
+            provisional = auto._compact_thread_text(prompt)[: auto.CODEX_INITIAL_NAME_MAX_CHARS]
+            FakeClient.threads = [
+                {"source": "cli", "name": None, "preview": "", "modelProvider": "openai"},
+                {"source": "cli", "name": provisional, "preview": prompt, "modelProvider": "openai"},
+            ]
+            with (
+                mock.patch.dict("os.environ", {"CODEX_AUTO_TITLE_STATE_DIR": state}, clear=False),
+                mock.patch.object(auto, "AppServerClient", FakeClient),
+                mock.patch.object(auto, "find_codex", return_value="codex"),
+                mock.patch.object(auto, "generate_title", return_value="Fix login bug") as generate,
+            ):
+                auto.handle_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": "s-empty-preview", "model": "gpt-test", "prompt": prompt}
+                )
+                generate.assert_called_once_with(prompt, model="gpt-test", provider="openai")
+                self.assertEqual(FakeClient.names, [("s-empty-preview", "Fix login bug")])
 
     def test_existing_name_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as state:
